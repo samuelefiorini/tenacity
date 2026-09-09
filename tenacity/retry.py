@@ -18,6 +18,8 @@ import abc
 import re
 import typing
 
+from tenacity._utils import override
+
 if typing.TYPE_CHECKING:
     from tenacity import RetryCallState
 
@@ -64,6 +66,7 @@ RetryBaseT = retry_base | typing.Callable[["RetryCallState"], bool]
 class _retry_never(retry_base):
     """Retry strategy that never rejects any result."""
 
+    @override
     def __call__(self, retry_state: "RetryCallState") -> bool:
         return False
 
@@ -74,6 +77,7 @@ retry_never = _retry_never()
 class _retry_always(retry_base):
     """Retry strategy that always rejects any result."""
 
+    @override
     def __call__(self, retry_state: "RetryCallState") -> bool:
         return True
 
@@ -87,6 +91,7 @@ class retry_if_exception(retry_base):
     def __init__(self, predicate: typing.Callable[[BaseException], bool]) -> None:
         self.predicate = predicate
 
+    @override
     def __call__(self, retry_state: "RetryCallState") -> bool:
         if retry_state.outcome is None:
             raise RuntimeError("__call__() called before outcome was set")
@@ -143,6 +148,7 @@ class retry_unless_exception_type(retry_if_exception):
     def _check(self, e: BaseException) -> bool:
         return not isinstance(e, self.exception_types)
 
+    @override
     def __call__(self, retry_state: "RetryCallState") -> bool:
         if retry_state.outcome is None:
             raise RuntimeError("__call__() called before outcome was set")
@@ -161,7 +167,7 @@ class retry_if_exception_cause_type(retry_base):
     """Retries if any of the causes of the raised exception is of one or more types.
 
     The check on the type of the cause of the exception is done recursively (until finding
-    an exception in the chain that has no `__cause__`)
+    an exception in the chain that has no ``__cause__``, or a cycle is detected).
     """
 
     def __init__(
@@ -171,13 +177,19 @@ class retry_if_exception_cause_type(retry_base):
     ) -> None:
         self.exception_cause_types = exception_types
 
+    @override
     def __call__(self, retry_state: "RetryCallState") -> bool:
         if retry_state.outcome is None:
             raise RuntimeError("__call__ called before outcome was set")
 
         if retry_state.outcome.failed:
             exc = retry_state.outcome.exception()
-            while exc is not None:
+            # Guard against cyclic __cause__ chains (e.g. ``raise e from e``),
+            # which would otherwise spin forever inside the predicate and
+            # prevent stop conditions from ever running (see #658).
+            seen: set[int] = set()
+            while exc is not None and id(exc) not in seen:
+                seen.add(id(exc))
                 if isinstance(exc.__cause__, self.exception_cause_types):
                     return True
                 exc = exc.__cause__
@@ -191,6 +203,7 @@ class retry_if_result(retry_base):
     def __init__(self, predicate: typing.Callable[[typing.Any], bool]) -> None:
         self.predicate = predicate
 
+    @override
     def __call__(self, retry_state: "RetryCallState") -> bool:
         if retry_state.outcome is None:
             raise RuntimeError("__call__() called before outcome was set")
@@ -206,6 +219,7 @@ class retry_if_not_result(retry_base):
     def __init__(self, predicate: typing.Callable[[typing.Any], bool]) -> None:
         self.predicate = predicate
 
+    @override
     def __call__(self, retry_state: "RetryCallState") -> bool:
         if retry_state.outcome is None:
             raise RuntimeError("__call__() called before outcome was set")
@@ -221,24 +235,26 @@ class retry_if_exception_message(retry_if_exception):
     def __init__(
         self,
         message: str | None = None,
-        match: None | str | re.Pattern[str] = None,
+        match: str | re.Pattern[str] | None = None,
     ) -> None:
-        if message and match:
+        if message is not None and match is not None:
             raise TypeError(
                 f"{self.__class__.__name__}() takes either 'message' or 'match', not both"
             )
 
-        if not message and not match:
+        if message is None and match is None:
             raise TypeError(
                 f"{self.__class__.__name__}() missing 1 required argument 'message' or 'match'"
             )
 
         self.message = message
-        self.match = re.compile(match) if match else None
+        self.match: re.Pattern[str] | None = (
+            re.compile(match) if match is not None else None
+        )
         super().__init__(self._check)
 
     def _check(self, exception: BaseException) -> bool:
-        if self.message:
+        if self.message is not None:
             return self.message == str(exception)
         assert self.match is not None
         return bool(self.match.match(str(exception)))
@@ -247,9 +263,11 @@ class retry_if_exception_message(retry_if_exception):
 class retry_if_not_exception_message(retry_if_exception_message):
     """Retries until an exception message equals or matches."""
 
+    @override
     def _check(self, exception: BaseException) -> bool:
         return not super()._check(exception)
 
+    @override
     def __call__(self, retry_state: "RetryCallState") -> bool:
         if retry_state.outcome is None:
             raise RuntimeError("__call__() called before outcome was set")
@@ -269,9 +287,11 @@ class retry_any(retry_base):
     def __init__(self, *retries: "RetryBaseT") -> None:
         self.retries = retries
 
+    @override
     def __call__(self, retry_state: "RetryCallState") -> bool:
         return any(r(retry_state) for r in self.retries)
 
+    @override
     def __ror__(self, other: "RetryBaseT") -> "retry_any":
         if isinstance(other, retry_any):
             return retry_any(*other.retries, *self.retries)
@@ -284,9 +304,11 @@ class retry_all(retry_base):
     def __init__(self, *retries: "RetryBaseT") -> None:
         self.retries = retries
 
+    @override
     def __call__(self, retry_state: "RetryCallState") -> bool:
         return all(r(retry_state) for r in self.retries)
 
+    @override
     def __rand__(self, other: "RetryBaseT") -> "retry_all":
         if isinstance(other, retry_all):
             return retry_all(*other.retries, *self.retries)

@@ -32,6 +32,7 @@ from tenacity import (
     after_nothing,
     before_nothing,
 )
+from tenacity._utils import override
 
 # Import all built-in retry strategies for easier usage.
 from .retry import (
@@ -75,16 +76,16 @@ class AsyncRetrying(BaseRetrying):
     def __init__(
         self,
         sleep: t.Callable[
-            [int | float], None | t.Awaitable[None]
+            [int | float], t.Awaitable[None] | None
         ] = _portable_async_sleep,
         stop: "StopBaseT" = tenacity.stop.stop_never,
         wait: "WaitBaseT" = tenacity.wait.wait_none(),
         retry: "SyncRetryBaseT | RetryBaseT" = tenacity.retry_if_exception_type(),
         before: t.Callable[
-            ["RetryCallState"], None | t.Awaitable[None]
+            ["RetryCallState"], t.Awaitable[None] | None
         ] = before_nothing,
-        after: t.Callable[["RetryCallState"], None | t.Awaitable[None]] = after_nothing,
-        before_sleep: t.Callable[["RetryCallState"], None | t.Awaitable[None]]
+        after: t.Callable[["RetryCallState"], t.Awaitable[None] | None] = after_nothing,
+        before_sleep: t.Callable[["RetryCallState"], t.Awaitable[None] | None]
         | None = None,
         reraise: bool = False,
         retry_error_cls: type["RetryError"] = RetryError,
@@ -108,13 +109,19 @@ class AsyncRetrying(BaseRetrying):
             enabled=enabled,
         )
 
+    @override
     async def __call__(  # type: ignore[override]
         self, fn: WrappedFn, *args: t.Any, **kwargs: t.Any
     ) -> WrappedFnReturnT:
+        is_async = _utils.is_coroutine_callable(fn)
+        if not self.enabled:
+            if is_async:
+                return await fn(*args, **kwargs)  # type: ignore[no-any-return]
+            return fn(*args, **kwargs)  # type: ignore[return-value]
+
         self.begin()
 
         retry_state = RetryCallState(retry_object=self, fn=fn, args=args, kwargs=kwargs)
-        is_async = _utils.is_coroutine_callable(fn)
         while True:
             do = await self.iter(retry_state=retry_state)
             if isinstance(do, DoAttempt):
@@ -133,28 +140,35 @@ class AsyncRetrying(BaseRetrying):
             else:
                 return do  # type: ignore[no-any-return]
 
+    @override
     def _add_action_func(self, fn: t.Callable[..., t.Any]) -> None:
         self.iter_state.actions.append(_utils.wrap_to_async_func(fn))
 
+    @override
     async def _run_retry(self, retry_state: "RetryCallState") -> None:  # type: ignore[override]
         self.iter_state.retry_run_result = await _utils.wrap_to_async_func(self.retry)(
             retry_state
         )
 
+    @override
     async def _run_wait(self, retry_state: "RetryCallState") -> None:  # type: ignore[override]
-        if self.wait:
-            sleep = await _utils.wrap_to_async_func(self.wait)(retry_state)
+        # See BaseRetrying._run_wait: falsy `wait` values mean "no wait" and
+        # reach us from untyped callers.
+        if not self.wait:  # type: ignore[truthy-bool]
+            retry_state.upcoming_sleep = 0.0
         else:
-            sleep = 0.0
+            retry_state.upcoming_sleep = await _utils.wrap_to_async_func(self.wait)(
+                retry_state
+            )
 
-        retry_state.upcoming_sleep = sleep
-
+    @override
     async def _run_stop(self, retry_state: "RetryCallState") -> None:  # type: ignore[override]
         self.statistics["delay_since_first_attempt"] = retry_state.seconds_since_start
         self.iter_state.stop_run_result = await _utils.wrap_to_async_func(self.stop)(
             retry_state
         )
 
+    @override
     async def iter(self, retry_state: "RetryCallState") -> DoAttempt | DoSleep | t.Any:
         self._begin_iter(retry_state)
         result = None
@@ -162,15 +176,30 @@ class AsyncRetrying(BaseRetrying):
             result = await action(retry_state)
         return result
 
+    @override
     def __iter__(self) -> t.Generator[AttemptManager, None, None]:
         raise TypeError("AsyncRetrying object is not iterable")
 
     def __aiter__(self) -> "AsyncRetrying":
+        if not self.enabled:
+            self._retry_state = RetryCallState(self, fn=None, args=(), kwargs={})
+            self._disabled_iter_done = False
+            return self
+
         self.begin()
         self._retry_state = RetryCallState(self, fn=None, args=(), kwargs={})
         return self
 
     async def __anext__(self) -> AttemptManager:
+        if not self.enabled:
+            if self._disabled_iter_done:
+                outcome = self._retry_state.outcome
+                if outcome is not None and outcome.failed:
+                    raise outcome.exception()  # type: ignore[misc]
+                raise StopAsyncIteration
+            self._disabled_iter_done = True
+            return AttemptManager(retry_state=self._retry_state)
+
         while True:
             do = await self.iter(retry_state=self._retry_state)
             if do is None:
@@ -183,6 +212,7 @@ class AsyncRetrying(BaseRetrying):
             else:
                 raise StopAsyncIteration
 
+    @override
     def wraps(self, fn: t.Callable[P, R]) -> _RetryDecorated[P, R]:
         wrapped = super().wraps(fn)
         # Ensure wrapper is recognized as a coroutine function.
@@ -196,8 +226,14 @@ class AsyncRetrying(BaseRetrying):
             # Always create a copy to prevent overwriting the local contexts when
             # calling the same wrapped functions multiple times in the same stack
             copy = self.copy()
-            async_wrapped.statistics = copy.statistics  # type: ignore[attr-defined]
-            self._local.statistics = copy.statistics
+            # Reuse the same statistics dict rather than rebinding the attribute
+            # so that the stats stay visible through additional decorators that
+            # copy attributes via functools.wraps (which copies the reference to
+            # this dict into the outer wrapper's __dict__). See issue #519.
+            stats = async_wrapped.statistics  # type: ignore[attr-defined]
+            stats.clear()
+            copy._local.statistics = stats  # noqa: SLF001
+            self._local.statistics = stats
             return await copy(fn, *args, **kwargs)  # type: ignore[type-var]
 
         # Preserve attributes

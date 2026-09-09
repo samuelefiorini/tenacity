@@ -84,8 +84,20 @@ class TestAsyncio(unittest.TestCase):
         assert thing.counter == thing.count
 
     @asynctest
+    async def test_wait_falsy_values_mean_no_wait(self) -> None:
+        # Mirrors the sync test: falsy `wait` values reach AsyncRetrying from
+        # untyped callers and must not raise from inside iter().
+        for wait in (None, 0):
+            thing = NoIOErrorAfterCount(2)
+            retrying = AsyncRetrying(
+                wait=wait,  # type: ignore[arg-type]
+                stop=stop_after_attempt(5),
+            )
+            await retrying(_async_function, thing)
+            assert thing.counter == thing.count
+
+    @asynctest
     async def test_iscoroutinefunction(self) -> None:
-        assert asyncio.iscoroutinefunction(_retryable_coroutine)
         assert inspect.iscoroutinefunction(_retryable_coroutine)
 
     @asynctest
@@ -109,6 +121,32 @@ class TestAsyncio(unittest.TestCase):
     def test_retry_attributes(self) -> None:
         assert hasattr(_retryable_coroutine, "retry")
         assert hasattr(_retryable_coroutine, "retry_with")
+
+    @asynctest
+    async def test_statistics_visible_through_outer_decorator(self) -> None:
+        """Statistics must resolve when @retry is wrapped by another decorator.
+
+        A well-behaved outer decorator uses functools.wraps, which copies the
+        inner wrapper's ``__dict__`` (including ``statistics``). Rebinding the
+        attribute on each call left the outer wrapper pointing at a stale empty
+        dict. See issue #519.
+        """
+
+        def outer(fn: _F) -> _F:
+            @wraps(fn)
+            async def wrapper(*args: Any, **kwargs: Any) -> Any:
+                return await fn(*args, **kwargs)
+
+            return wrapper  # type: ignore[return-value]
+
+        @outer
+        @retry(stop=stop_after_attempt(3))
+        async def my_call() -> str:
+            return "ok"
+
+        assert await my_call() == "ok"
+        assert my_call.statistics["attempt_number"] == 1
+        assert my_call.statistics is my_call.__wrapped__.statistics
 
     def test_retry_preserves_argument_defaults(self) -> None:
         async def function_with_defaults(a: int = 1) -> int:
@@ -176,6 +214,72 @@ class TestAsyncEnabled(unittest.TestCase):
             await always_fails()
         assert call_count == 1
 
+    @asynctest
+    async def test_enabled_false_aiter_raises_original_exception(self) -> None:
+        """When enabled=False, the async iterator raises the original exception,
+        not a RetryError, and the body executes exactly once."""
+        call_count = 0
+        retrying = AsyncRetrying(
+            enabled=False,
+            stop=stop_after_attempt(5),
+        )
+        with pytest.raises(ValueError, match="fail"):
+            async for attempt in retrying:
+                with attempt:
+                    call_count += 1
+                    raise ValueError("fail")
+        assert call_count == 1
+
+    @asynctest
+    async def test_enabled_false_aiter_succeeds_on_first_attempt(self) -> None:
+        """When enabled=False, the async iterator runs the body once and stops."""
+        call_count = 0
+        retrying = AsyncRetrying(
+            enabled=False,
+            stop=stop_after_attempt(5),
+        )
+        async for attempt in retrying:
+            with attempt:
+                call_count += 1
+        assert call_count == 1
+
+    @asynctest
+    async def test_enabled_false_call_raises_original_exception(self) -> None:
+        """When enabled=False, awaiting the controller directly raises the original
+        exception, not a RetryError, and the coroutine executes exactly once."""
+        call_count = 0
+
+        async def always_fails() -> None:
+            nonlocal call_count
+            call_count += 1
+            raise ValueError("fail")
+
+        retrying = AsyncRetrying(
+            enabled=False,
+            stop=stop_after_attempt(5),
+        )
+        with pytest.raises(ValueError, match="fail"):
+            await retrying(always_fails)
+        assert call_count == 1
+
+    @asynctest
+    async def test_enabled_false_call_succeeds_on_first_attempt(self) -> None:
+        """When enabled=False, awaiting the controller directly runs the coroutine
+        once and returns its result."""
+        call_count = 0
+
+        async def succeeds() -> str:
+            nonlocal call_count
+            call_count += 1
+            return "ok"
+
+        retrying = AsyncRetrying(
+            enabled=False,
+            stop=stop_after_attempt(5),
+        )
+        assert await retrying(succeeds) == "ok"
+        assert call_count == 1
+
 
 @unittest.skipIf(not have_trio, "trio not installed")
 class TestTrio(unittest.TestCase):
@@ -237,6 +341,29 @@ class TestContextManager(unittest.TestCase):
             pass
         else:
             raise Exception
+
+    @asynctest
+    async def test_reraise_try_again_with_cause(self) -> None:
+        # When TryAgain is raised from within an "except" block, reraise=True
+        # should surface the underlying exception rather than TryAgain itself.
+        class UnderlyingError(Exception):
+            pass
+
+        async def _test() -> None:
+            try:
+                raise UnderlyingError("boom")
+            except UnderlyingError:
+                # Implicit chaining via __context__ is exactly what we test.
+                raise tenacity.TryAgain  # noqa: B904
+
+        retrying = tasyncio.AsyncRetrying(
+            stop=stop_after_attempt(2),
+            retry=tenacity.retry_never,
+            reraise=True,
+        )
+        with pytest.raises(UnderlyingError):
+            await retrying(_test)
+        self.assertEqual(2, retrying.statistics["attempt_number"])
 
     @asynctest
     async def test_sleeps(self) -> None:

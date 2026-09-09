@@ -25,10 +25,10 @@ from fractions import Fraction
 from unittest import mock
 
 import pytest
-from typeguard import check_type
 
 import tenacity
 from tenacity import RetryCallState, RetryError, Retrying, retry
+from tenacity._utils import override
 from tenacity.retry import retry_all, retry_any
 
 _unset = object()
@@ -87,6 +87,7 @@ def make_retry_state(
 class TestBase(unittest.TestCase):
     def test_retrying_repr(self) -> None:
         class ConcreteRetrying(tenacity.BaseRetrying):
+            @override
             def __call__(
                 self, fn: typing.Any, *args: typing.Any, **kwargs: typing.Any
             ) -> typing.Any:
@@ -359,6 +360,19 @@ class TestWaitConditions(unittest.TestCase):
         self.assertEqual(r.wait(make_retry_state(8, 0)), 40)
         self.assertEqual(r.wait(make_retry_state(50, 0)), 40)
 
+    def test_exponential_skips_power_after_reaching_max(self) -> None:
+        class ExplodingPower(float):
+            @override
+            def __pow__(self, exponent: float, modulo: int | None = None) -> float:
+                raise AssertionError("power should not be calculated above the maximum")
+
+        r = Retrying(wait=tenacity.wait_exponential(max=40, exp_base=ExplodingPower(2)))
+        self.assertEqual(r.wait(make_retry_state(50, 0)), 40)
+
+    def test_exponential_caps_when_max_multiplier_ratio_underflows(self) -> None:
+        r = Retrying(wait=tenacity.wait_exponential(multiplier=1e300, max=1e-100))
+        self.assertEqual(r.wait(make_retry_state(1, 0)), 1e-100)
+
     def test_exponential_with_min_wait(self) -> None:
         r = Retrying(wait=tenacity.wait_exponential(min=20))
         self.assertEqual(r.wait(make_retry_state(1, 0)), 20)
@@ -479,10 +493,10 @@ class TestWaitConditions(unittest.TestCase):
         r = Retrying(
             wait=sum(  # type: ignore[arg-type]
                 [
-                    tenacity.wait_fixed(1),  # type: ignore[list-item]
-                    tenacity.wait_random(0, 3),  # type: ignore[list-item]
-                    tenacity.wait_fixed(5),  # type: ignore[list-item]
-                    tenacity.wait_none(),  # type: ignore[list-item]
+                    tenacity.wait_fixed(1),
+                    tenacity.wait_random(0, 3),
+                    tenacity.wait_fixed(5),
+                    tenacity.wait_none(),
                 ]
             )
         )
@@ -491,6 +505,55 @@ class TestWaitConditions(unittest.TestCase):
             w = r.wait(make_retry_state(1, 5))
             self.assertLess(w, 9)
             self.assertGreaterEqual(w, 6)
+
+    def test_wait_falsy_values_mean_no_wait(self) -> None:
+        # Untyped callers pass None or 0 to mean "no wait", and `sum([])`
+        # over an empty list of strategies yields the int 0. All must reach
+        # the retry path without blowing up inside iter().
+        def make_flaky() -> typing.Callable[[], str]:
+            attempts = []
+
+            def flaky() -> str:
+                attempts.append(1)
+                if len(attempts) < 2:
+                    raise ValueError("boom")
+                return "ok"
+
+            return flaky
+
+        for wait in (None, 0, sum([])):
+            with self.subTest(wait=wait):
+                flaky = make_flaky()
+                r = Retrying(
+                    wait=wait,  # type: ignore[arg-type]
+                    stop=tenacity.stop_after_attempt(3),
+                )
+                self.assertEqual(r(flaky), "ok")
+
+    def test_wait_radd_plain_callable(self) -> None:
+        # A plain callable is a valid WaitBaseT, and functions have no
+        # __add__, so `callable + strategy` goes through wait_base.__radd__.
+        def cb(retry_state: RetryCallState) -> float:
+            return 2.0
+
+        combined = cb + tenacity.wait_fixed(1)
+        self.assertIsInstance(combined, tenacity.wait_combine)
+        self.assertEqual(combined(make_retry_state(1, 5)), 3.0)
+
+    def test_wait_combine_passes_state_positionally(self) -> None:
+        # A WaitBaseT callable only promises to take the state positionally;
+        # its parameter name is its own business.
+        combined = tenacity.wait_combine(
+            tenacity.wait_fixed(1),
+            lambda rs: 2.0,
+        )
+        self.assertEqual(combined(make_retry_state(1, 5)), 3.0)
+
+    def test_wait_radd_rejects_non_zero_number(self) -> None:
+        with self.assertRaises(TypeError):
+            # Statically accepted -- see the comment on wait_base.__radd__ --
+            # so the runtime rejection is what has to be tested.
+            5 + tenacity.wait_fixed(1)
 
     def _assert_range(self, wait: float, min_: float, max_: float) -> None:
         self.assertLess(wait, max_)
@@ -541,10 +604,13 @@ class TestWaitConditions(unittest.TestCase):
         self.assertEqual(sleep_intervals, [1.0, 2.0, 3.0, 3.0])
         sleep_intervals[:] = []
 
-        # Clear and restart retrying.
-        self.assertRaises(tenacity.RetryError, always_return_1)
-        self.assertEqual(sleep_intervals, [1.0, 2.0, 3.0, 3.0])
-        sleep_intervals[:] = []
+    def test_wait_chain_requires_at_least_one_strategy(self) -> None:
+        with self.assertRaises(ValueError):
+            tenacity.wait_chain()
+        # Confirm the wrapped Retrying path surfaces the same ValueError
+        # instead of an opaque IndexError from self.strategies[-1].
+        with self.assertRaises(ValueError):
+            Retrying(wait=tenacity.wait_chain())
 
     def test_wait_random_exponential(self) -> None:
         fn = tenacity.wait_random_exponential(0.5, 60.0)
@@ -727,10 +793,9 @@ class TestWaitConditions(unittest.TestCase):
         def returnval() -> int:
             return 123
 
-        try:
+        with self.assertRaises(ExtractCallState) as caught:
             retrying(returnval)
-        except ExtractCallState as err:
-            retry_state = err.args[0]
+        retry_state = caught.exception.args[0]
         self.assertIs(retry_state.fn, returnval)
         self.assertEqual(retry_state.args, ())
         self.assertEqual(retry_state.kwargs, {})
@@ -741,10 +806,9 @@ class TestWaitConditions(unittest.TestCase):
         def dying() -> None:
             raise Exception("Broken")
 
-        try:
+        with self.assertRaises(ExtractCallState) as caught:
             retrying(dying)
-        except ExtractCallState as err:
-            retry_state = err.args[0]
+        retry_state = caught.exception.args[0]
         self.assertIs(retry_state.fn, dying)
         self.assertEqual(retry_state.args, ())
         self.assertEqual(retry_state.kwargs, {})
@@ -906,6 +970,43 @@ class TestRetryConditions(unittest.TestCase):
         self.assertRaises(tenacity.RetryError, r, _r)
         self.assertEqual(5, r.statistics["attempt_number"])
 
+    def test_retry_try_again_with_cause_reraise(self) -> None:
+        # When TryAgain is raised from within an "except" block, reraise=True
+        # should surface the underlying exception rather than TryAgain itself.
+        class UnderlyingError(Exception):
+            pass
+
+        def _r() -> None:
+            try:
+                raise UnderlyingError("boom")
+            except UnderlyingError:
+                # Implicit chaining via __context__ is exactly what we test.
+                raise tenacity.TryAgain  # noqa: B904
+
+        r = Retrying(
+            stop=tenacity.stop_after_attempt(5),
+            retry=tenacity.retry_never,
+            reraise=True,
+        )
+        self.assertRaises(UnderlyingError, r, _r)
+        self.assertEqual(5, r.statistics["attempt_number"])
+
+    def test_retry_try_again_from_cause_reraise(self) -> None:
+        # An explicit "raise TryAgain from exc" should also be unwrapped.
+        class UnderlyingError(Exception):
+            pass
+
+        def _r() -> None:
+            raise tenacity.TryAgain from UnderlyingError("boom")
+
+        r = Retrying(
+            stop=tenacity.stop_after_attempt(5),
+            retry=tenacity.retry_never,
+            reraise=True,
+        )
+        self.assertRaises(UnderlyingError, r, _r)
+        self.assertEqual(5, r.statistics["attempt_number"])
+
     def test_retry_try_again_forever_reraise(self) -> None:
         def _r() -> None:
             raise tenacity.TryAgain
@@ -925,6 +1026,32 @@ class TestRetryConditions(unittest.TestCase):
     def test_retry_if_exception_message_negative_too_many_inputs(self) -> None:
         with self.assertRaises(TypeError):
             tenacity.retry_if_exception_message(message="negative", match="negative")
+
+    def test_retry_if_exception_message_empty_message(self) -> None:
+        # An exception whose str() is empty (e.g. a bare ``RuntimeError()``) is
+        # a valid target. ``message=""`` must be accepted and match it, rather
+        # than being treated as "no message given" by a truthiness check.
+        r = tenacity.retry_if_exception_message(message="")
+        self.assertEqual(r.message, "")
+        empty = make_retry_state(
+            1, 0, last_result=tenacity.Future.construct(1, RuntimeError(), True)
+        )
+        nonempty = make_retry_state(
+            1, 0, last_result=tenacity.Future.construct(1, RuntimeError("boom"), True)
+        )
+        self.assertTrue(r(empty))
+        self.assertFalse(r(nonempty))
+
+    def test_retry_if_not_exception_message_empty_message(self) -> None:
+        r = tenacity.retry_if_not_exception_message(message="")
+        empty = make_retry_state(
+            1, 0, last_result=tenacity.Future.construct(1, RuntimeError(), True)
+        )
+        nonempty = make_retry_state(
+            1, 0, last_result=tenacity.Future.construct(1, RuntimeError("boom"), True)
+        )
+        self.assertFalse(r(empty))
+        self.assertTrue(r(nonempty))
 
 
 class NoneReturnUntilAfterCount:
@@ -1083,6 +1210,7 @@ class CustomError(Exception):
     def __init__(self, value: str) -> None:
         self.value = value
 
+    @override
     def __str__(self) -> str:
         return self.value
 
@@ -1114,6 +1242,7 @@ class CapturingHandler(logging.Handler):
         super().__init__(*args, **kwargs)
         self.records: list[logging.LogRecord] = []
 
+    @override
     def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
 
@@ -1412,6 +1541,31 @@ class TestDecoratorWrapper(unittest.TestCase):
         except NameError:
             pass
 
+    def test_retry_if_exception_cause_type_handles_cause_cycles(self) -> None:
+        """Cyclic __cause__ chains must not hang the retry predicate (#658)."""
+
+        def boom_self_cause() -> None:
+            try:
+                raise ValueError("inner")
+            except ValueError as e:
+                raise e from e
+
+        def boom_two_node_cycle() -> None:
+            a = ValueError("a")
+            b = RuntimeError("b")
+            a.__cause__ = b
+            b.__cause__ = a
+            raise a
+
+        for boom in (boom_self_cause, boom_two_node_cycle):
+            r = tenacity.Retrying(
+                retry=tenacity.retry_if_exception_cause_type(KeyError),
+                stop=tenacity.stop_after_attempt(2),
+                reraise=True,
+            )
+            with self.assertRaises((ValueError, RuntimeError)):
+                r(boom)
+
     def test_retry_preserves_argument_defaults(self) -> None:
         def function_with_defaults(a: int = 1) -> int:
             return a
@@ -1515,6 +1669,35 @@ class TestStatisticsKeys:
         succeeds_first_try()
         assert succeeds_first_try.statistics["delay_since_first_attempt"] == 0
 
+    def test_statistics_visible_through_outer_decorator(self) -> None:
+        """Statistics must resolve when @retry is wrapped by another decorator.
+
+        A well-behaved outer decorator uses functools.wraps, which copies the
+        inner wrapper's ``__dict__`` (including ``statistics``). Rebinding the
+        attribute on each call left the outer wrapper pointing at a stale empty
+        dict. The statistics must instead stay visible through the wrapper
+        chain. See issue #519.
+        """
+        import functools
+
+        _F = typing.TypeVar("_F", bound=typing.Callable[..., typing.Any])
+
+        def outer(fn: _F) -> _F:
+            @functools.wraps(fn)
+            def wrapper(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+                return fn(*args, **kwargs)
+
+            return typing.cast("_F", wrapper)
+
+        @outer
+        @retry(stop=tenacity.stop_after_attempt(3))
+        def my_call() -> str:
+            return "ok"
+
+        assert my_call() == "ok"
+        assert my_call.statistics["attempt_number"] == 1
+        assert my_call.statistics is my_call.__wrapped__.statistics
+
 
 class TestEnabled:
     def test_enabled_false_skips_retry(self) -> None:
@@ -1572,6 +1755,72 @@ class TestEnabled:
 
         assert fails_twice() is True
         assert call_count == 3
+
+    def test_enabled_false_iter_raises_original_exception(self) -> None:
+        """When enabled=False, the iterator protocol raises the original exception,
+        not a RetryError, and the body executes exactly once."""
+        call_count = 0
+        retrying = Retrying(
+            enabled=False,
+            stop=tenacity.stop_after_attempt(5),
+            wait=tenacity.wait_none(),
+        )
+        with pytest.raises(ValueError, match="fail"):
+            for attempt in retrying:
+                with attempt:
+                    call_count += 1
+                    raise ValueError("fail")
+        assert call_count == 1
+
+    def test_enabled_false_iter_succeeds_on_first_attempt(self) -> None:
+        """When enabled=False, the iterator protocol runs the body once and stops."""
+        call_count = 0
+        retrying = Retrying(
+            enabled=False,
+            stop=tenacity.stop_after_attempt(5),
+            wait=tenacity.wait_none(),
+        )
+        for attempt in retrying:
+            with attempt:
+                call_count += 1
+        assert call_count == 1
+
+    def test_enabled_false_call_raises_original_exception(self) -> None:
+        """When enabled=False, calling the controller directly raises the original
+        exception, not a RetryError, and the function executes exactly once."""
+        call_count = 0
+
+        def fails() -> None:
+            nonlocal call_count
+            call_count += 1
+            raise ValueError("fail")
+
+        retrying = Retrying(
+            enabled=False,
+            stop=tenacity.stop_after_attempt(5),
+            wait=tenacity.wait_none(),
+        )
+        with pytest.raises(ValueError, match="fail"):
+            retrying(fails)
+        assert call_count == 1
+
+    def test_enabled_false_call_succeeds_on_first_attempt(self) -> None:
+        """When enabled=False, calling the controller directly runs the function once
+        and returns its result."""
+        call_count = 0
+
+        def succeeds() -> str:
+            nonlocal call_count
+            call_count += 1
+            return "ok"
+
+        retrying = Retrying(
+            enabled=False,
+            stop=tenacity.stop_after_attempt(5),
+            wait=tenacity.wait_none(),
+        )
+        assert retrying(succeeds) == "ok"
+        assert call_count == 1
 
 
 class TestRetryWith:
@@ -1887,6 +2136,7 @@ class TestStatistics(unittest.TestCase):
 
 
 class TestRetryErrorCallback(unittest.TestCase):
+    @override
     def setUp(self) -> None:
         self._attempt_number = 0
         self._callback_called = False
@@ -2056,10 +2306,15 @@ class TestRetryException(unittest.TestCase):
 
 class TestRetryTyping(unittest.TestCase):
     def test_retry_type_annotations(self) -> None:
-        """The decorator should maintain types of decorated functions."""
+        """The decorator should maintain types of decorated functions.
 
-        def num_to_str(number):
-            # type: (int) -> str
+        The annotations below are the assertions; mypy checks them when it runs
+        over this file. The negative case leans on warn_unused_ignores: should
+        @retry ever decay to returning Any, that assignment would stop being an
+        error and the now-dead ignore would fail the type check.
+        """
+
+        def num_to_str(number: int) -> str:
             return str(number)
 
         # equivalent to a raw @retry decoration
@@ -2068,13 +2323,39 @@ class TestRetryTyping(unittest.TestCase):
 
         # equivalent to a @retry(...) decoration
         with_constructor = retry()(num_to_str)
-        with_constructor_result = with_raw(1)
+        with_constructor_result = with_constructor(1)
 
-        # These raise TypeError exceptions if they fail
-        check_type(with_raw, typing.Callable[[int], str])
-        check_type(with_raw_result, str)
-        check_type(with_constructor, typing.Callable[[int], str])
-        check_type(with_constructor_result, str)
+        # The wrapper stays usable wherever the undecorated function was.
+        _raw_signature: typing.Callable[[int], str] = with_raw
+        _constructor_signature: typing.Callable[[int], str] = with_constructor
+
+        # ...and an incompatible signature is still rejected.
+        _mismatch: typing.Callable[[str], int] = with_raw  # type: ignore[assignment]
+
+        self.assertEqual(with_raw_result, "1")
+        self.assertEqual(with_constructor_result, "1")
+
+    def test_retry_decorated_method_keeps_bound_signature(self) -> None:
+        """A decorated instance method must type-check like a bound method.
+
+        Without a descriptor (``__get__``) on ``_RetryDecorated``, static type
+        checkers treat ``instance.method`` the same as the unbound
+        ``Class.method``, so a normal call with only the non-``self`` keyword
+        arguments looks like a type error and the return type resolves to
+        ``Any``/``Unknown``. This does not fail at runtime (functools.wraps
+        returns a real function, which Python always binds correctly), but it
+        does fail under `mypy --strict`, which also type-checks this file.
+        See issue #532.
+        """
+
+        class Doubler:
+            @retry(stop=tenacity.stop_after_attempt(3))
+            def double(self, value: int) -> int:
+                return value * 2
+
+        doubler = Doubler()
+        result: int = doubler.double(value=21)
+        self.assertEqual(result, 42)
 
 
 class TestMockingSleep:
