@@ -280,6 +280,7 @@ class wait_fibonacci(wait_base):
         self._serie.append(next_value)
         return next_value
 
+    @override
     def __call__(self, retry_state: "RetryCallState") -> float:
         """Return the next wait time from the Fibonacci sequence."""
         try:
